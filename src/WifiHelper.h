@@ -10,22 +10,9 @@
 
 #include "MQTTConfig.h"
 #include <stdlib.h>
-#include "lwesp/lwesp.h"
 
-#ifndef ESP01_RST_PIN
-#define ESP01_RST_PIN 11
-#endif
-
-#ifndef ESP01_RST_DELAY
-#define ESP01_RST_DELAY 2000
-#endif
-
-#ifndef ESP01_SNTP_TIMEZONE
-#define ESP01_SNTP_TIMEZONE 0
-#endif
-
-#ifndef ESP01_SNTP_LOCAL_HOST
-#define ESP01_SNTP_LOCAL_HOST "178.79.160.57"
+#ifndef DEFAULT_SNTP_HOST
+#define DEFAULT_SNTP_HOST "0.uk.pool.ntp.org"
 #endif
 
 class WifiHelper {
@@ -42,8 +29,6 @@ public:
 	 */
 	static bool connectToAp(const char * sid, const char *passwd);
 
-
-	static bool autoJoinOrConfig();
 
 	/***
 	 * Get IP address of unit
@@ -63,23 +48,14 @@ public:
 	static bool getMACAddressStr(char *macStr);
 
 
-	static bool syncRTCwithSNTP();
+	static bool syncRTCwithSNTP(const char * host = NULL);
 
 	static bool isJoined();
 
 
 private:
 
-	static void setupGPIO();
-
-	static void resetESP01();
-
-	static void sntpSetupCB(lwespr_t resp, void* args);
-
-	static void syncRTCCB(lwespr_t resp, void* args);
-
-	static lwesp_datetime_t dateTime;
-
+	static int32_t sntp_get_time (const char *server, uint32_t *seconds);
 
 };
 
