@@ -10,6 +10,7 @@
 
 #include "MQTTConfig.h"
 #include <stdlib.h>
+#include <ctime>
 
 #ifndef DEFAULT_SNTP_HOST
 #define DEFAULT_SNTP_HOST "0.uk.pool.ntp.org"
@@ -55,7 +56,7 @@ public:
 
 private:
 
-	static int32_t sntp_get_time (const char *server, uint32_t *seconds);
+	static int32_t sntp_get_time (const char *server, time_t *seconds);
 
 };
 

@@ -149,9 +149,9 @@ bool WifiHelper::getMACAddressStr(char *macStr){
 bool WifiHelper::syncRTCwithSNTP(const char * host){
 	char targetHost[] = DEFAULT_SNTP_HOST;
 	int32_t retval;
-	uint32_t raw;
-	time_t time;
+	time_t raw;
 	struct tm * timeinfo;
+	struct tm timeBuf;
 	datetime_t date;
 	char datetime_buf[256];
 
@@ -161,23 +161,32 @@ bool WifiHelper::syncRTCwithSNTP(const char * host){
 		retval = WifiHelper::sntp_get_time(host, &raw);
 	}
 
-	printf("sntp returned %d time %ld\n\r", retval, raw);
-
 	if (retval == 0){
-		time = (time_t)raw;
-		timeinfo = localtime (&time);
+
+		timeinfo = localtime_r( &raw, &timeBuf );
+	/*
+		printf("TimeInfo(%lld): %d-%d-%d %d:%d:%d\n\r",
+				raw,
+				timeinfo->tm_year + 1900,
+				timeinfo->tm_mon + 1,
+				timeinfo->tm_mday,
+				timeinfo->tm_hour,
+				timeinfo->tm_min,
+				timeinfo->tm_sec
+				);
+	*/
+
 		memset(&date, 0, sizeof(date));
 		date.sec = timeinfo->tm_sec;
 		date.min = timeinfo->tm_min;
 		date.hour = timeinfo->tm_hour;
 		date.day = timeinfo->tm_mday;
-		date.month = timeinfo->tm_mon;
-		date.year = timeinfo->tm_year;
+		date.month = timeinfo->tm_mon + 1;
+		date.year = timeinfo->tm_year + 1900;
 
 		rtc_init();
 		rtc_set_datetime (&date);
 
-		rtc_get_datetime(&date);
 		datetime_to_str(datetime_buf, sizeof(datetime_buf), &date);
 		LogInfo(("Time: %s\n\r", datetime_buf));
 
@@ -190,9 +199,6 @@ bool WifiHelper::syncRTCwithSNTP(const char * host){
 }
 
 
-
-
-
 bool WifiHelper::isJoined(){
 	int32_t ret = Driver_WiFi1.IsConnected();
 	return (ret != 0);
@@ -200,7 +206,7 @@ bool WifiHelper::isJoined(){
 
 
 
-int32_t WifiHelper::sntp_get_time (const char *server, uint32_t *seconds) {
+int32_t WifiHelper::sntp_get_time (const char *server, time_t *seconds) {
   int32_t  socket;
   uint8_t  buf[48];
   uint8_t  ip[4];
