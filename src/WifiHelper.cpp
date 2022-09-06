@@ -58,8 +58,8 @@ bool WifiHelper::connectToAp(const char * sid, const char *passwd){
 
 	memset((void *)&config, 0, sizeof(config));
 
-	config.ssid     = WIFI_SSID;
-	config.pass     = WIFI_PASSWORD;
+	config.ssid     = sid;
+	config.pass     = passwd;
 	config.security = SECURITY_TYPE;
 	config.ch       = 0U;
 

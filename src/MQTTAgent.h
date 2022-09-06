@@ -1,6 +1,8 @@
 /*
  * MQTTAgent.h
  *
+ * MQTT Agent to manage MQTT connection and messaging
+ *
  *  Created on: 15 Nov 2021
  *      Author: jondurrant
  */
@@ -8,38 +10,50 @@
 #ifndef MQTTAGENT_H_
 #define MQTTAGENT_H_
 
-#include "FreeRTOS.h"
-#include "lwesp/lwesp.h"
-#include "lwesp/apps/lwesp_mqtt_client_api.h"
-
 #include "MQTTConfig.h"
+#include "FreeRTOS.h"
+#include "core_mqtt.h"
+#include "core_mqtt_agent.h"
 #include "MQTTInterface.h"
 #include "MQTTRouter.h"
+#include "MQTTTopicHelper.h"
+#include "IoTSockTrans.h"
 #include "MQTTAgentObserver.h"
 
+extern "C" {
+#include "freertos_agent_message.h"
+#include "freertos_command_pool.h"
+}
+
+#ifndef MQTT_AGENT_NETWORK_BUFFER_SIZE
+#define MQTT_AGENT_NETWORK_BUFFER_SIZE 512
+#endif
+
+#ifndef MAXSUBS
+#define MAXSUBS 12
+#endif
+
+#ifndef MQTTKEEPALIVETIME
+#define MQTTKEEPALIVETIME 10
+#endif
 
 #ifndef MQTT_RECON_DELAY
-#define MQTT_RECON_DELAY 3000
-#endif
-
-#ifndef MQTT_KEEP_ALIVE
-#define MQTT_KEEP_ALIVE 10
+#define MQTT_RECON_DELAY 10
 #endif
 
 
-enum MQTTState {  Offline, MQTTConn, MQTTRecon, MQTTConned, Online};
+// Enumerator used to control the state machine at centre of agent
+enum MQTTState {  Offline, TCPReq, TCPConned, MQTTReq, MQTTConned, MQTTRecon, Online};
 
-class MQTTAgent: public MQTTInterface {
+class MQTTAgent: public MQTTInterface{
 public:
 	/***
 	 * Constructor
-	 * @param rxBufSize - size of rx buffer to create
-	 * @param txBufSize - size of tx buffer to create
 	 */
-	MQTTAgent(size_t rxBufSize, size_t txBufSize);
+	MQTTAgent();
 
 	/***
-	 * Destructor
+	 * Distructor
 	 */
 	virtual ~MQTTAgent();
 
@@ -54,18 +68,18 @@ public:
 	void credentials(const char * user, const char * passwd, const char * id = NULL );
 
 	/***
-	 * Connect to mqtt server
+	 * Connect to mqtt server - Actual connection is done in the state machine so task must be running
 	 * @param target - hostname or ip address, Not copied so pointer must remain valid
 	 * @param port - port number
-	 * @param recon - reconnect on disconnect
+	 * @param ssl - unused
 	 * @return
 	 */
-	 bool connect(char * target, lwesp_port_t  port, bool recon=false, bool ssl=false);
+	 bool mqttConnect(const char * target, uint16_t  port, bool recon=false, bool ssl=false);
 
-	 /***
-	 *  create the vtask, will get picked up by scheduler
-	 *
-	 *  */
+	/***
+	 * Start the task running
+	 * @param priority - priority to run within FreeRTOS
+	 */
 	void start(UBaseType_t priority = tskIDLE_PRIORITY);
 
 	/***
@@ -74,9 +88,8 @@ public:
 	 */
 	void stop();
 
-
 	/***
-	 * Returns the id of the client
+	 * Returns the id of the MQTT client
 	 * @return
 	 */
 	virtual const char * getId();
@@ -86,10 +99,18 @@ public:
 	 * @param topic - zero terminated string. Copied by function
 	 * @param payload - payload as pointer to memory block
 	 * @param payloadLen - length of memory block
-	 * @param QoS, QoS level of publish (0-2)
 	 */
-	virtual bool pubToTopic(const char * topic, const void * payload,
+	virtual bool pubToTopic(const char * topic,  const void * payload,
 			size_t payloadLen, const uint8_t QoS=0);
+
+	/***
+	 * Subscribe to a topic, mesg will be sent to router object
+	 * @param topic
+	 * @param QoS
+	 * @return
+	 */
+	virtual bool subToTopic(const char * topic, const uint8_t QoS=0);
+
 
 	/***
 	 * Close connection
@@ -105,27 +126,20 @@ public:
 	 */
 	virtual void route(const char * topic, size_t topicLen, const void * payload, size_t payloadLen);
 
+
 	/***
 	 * Get the router object handling all received messages
 	 * @return
 	 */
 	MQTTRouter* getRouter() ;
 
+
 	/***
-	 * Set the rotuer object
+	 * Set the router object
+	 * Router objects handle any message arriving
 	 * @param pRouter
 	 */
 	void setRouter( MQTTRouter *pRouter = NULL);
-
-
-	/***
-	 * Subscribe to a topic, mesg will be sent to router object
-	 * @param topic
-	 * @param QoS
-	 * @return
-	 */
-	virtual bool subToTopic(const char * topic, const uint8_t QoS=0);
-
 
 	/***
 	 * Set a single observer to get call back on state changes
@@ -133,7 +147,38 @@ public:
 	 */
 	virtual void setObserver(MQTTAgentObserver *obs);
 
+
+	/***
+	 * Get the FreeRTOS task being used
+	 * @return
+	 */
+	virtual TaskHandle_t getTask();
+
+	/***
+	 * Get high water for stack
+	 * @return close to zero means overflow risk
+	 */
+	virtual unsigned int getStakHighWater();
+
 private:
+	/***
+	 * Initialisation code
+	 * @return
+	 */
+	MQTTStatus_t init();
+
+
+	/***
+	 * Callback on when new data is received
+	 * @param pMqttAgentContext
+	 * @param packetId
+	 * @param pxPublishInfo
+	 */
+	static void incomingPublishCallback( MQTTAgentContext_t * pMqttAgentContext,
+            uint16_t packetId,
+            MQTTPublishInfo_t * pxPublishInfo );
+
+
 	/***
 	 * Task object running to manage MQTT interface
 	 * @param pvParameters
@@ -141,10 +186,29 @@ private:
 	static void vTask( void * pvParameters );
 
 	/***
-	 * Initialise the object
-	 * @return
+	 * Call back function on connect
+	 * @param pCmdCallbackContext
+	 * @param pReturnInfo
 	 */
-	bool init();
+	static void connectCmdCallback( MQTTAgentCommandContext_t * pCmdCallbackContext,
+            MQTTAgentReturnInfo_t * pReturnInfo );
+
+	/***
+	 * Call back function nwhen subscribe completes
+	 * @param pCmdCallbackContext
+	 * @param pReturnInfo
+	 */
+	static void subscribeCmdCompleteCb( MQTTAgentCommandContext_t * pCmdCallbackContext,
+	                             MQTTAgentReturnInfo_t * pReturnInfo );
+
+	/***
+	 * Call back function when Publish completes
+	 * @param pCmdCallbackContext
+	 * @param pReturnInfo
+	 */
+	static void publishCmdCompleteCb( MQTTAgentCommandContext_t * pCmdCallbackContext,
+            MQTTAgentReturnInfo_t * pReturnInfo );
+
 
 	/***
 	 * Run loop for the task
@@ -152,22 +216,22 @@ private:
 	void run();
 
 	/***
-	 * Connect to server
+	 * Connect to MQTT hub
 	 * @return
 	 */
-	bool mqttConn();
+	MQTTStatus_t MQTTconn();
 
 	/***
-	 * Subscribe step on connection
-	 * @return
+	 * Subscribe to routers list
+	 * @return true if succeeds
 	 */
-	bool mqttSub();
+	bool MQTTsub();
 
 	/***
-	 * Handle Rec of a messahe
-	 * @return
+	 * Perform TCP Connection
+	 * @return true if succeeds
 	 */
-	bool mqttRec();
+	bool TCPconn();
 
 	/***
 	 * Set the connection state variable
@@ -175,37 +239,56 @@ private:
 	 */
 	void setConnState(MQTTState s);
 
-	//MQTT Server details
-	const char * user;
-	const char * passwd;
-	const char * id;
-	const char * target = NULL;
-	lwesp_port_t port = 1883 ;
-	bool recon = false;
-	bool ssl = false;
 
-	//Router object used for message processing
+	NetworkContext_t xNetworkContext;
+	IoTSockTrans xTcpTrans;
+
+	//MQTT Server and credentials
+	const char * pUser;
+	const char * pPasswd;
+	const char * pId;
+	const char * pTarget = NULL;
+	char xMacStr[14];
+	uint16_t xPort = 1883 ;
+	bool xSsl = false;
+	bool xRecon = false;
+
+	//MQTT Will object
+	static const char * WILLTOPICFORMAT;
+	char *pWillTopic = NULL;
+	static const char * WILLPAYLOAD;
+	MQTTPublishInfo_t xWillInfo;
+
+	//Topics and payload for connection
+	static const char * ONLINEPAYLOAD;
+	char *pOnlineTopic = NULL;
+	char *pKeepAliveTopic = NULL;
+
+
+	//Router object to handle all sub messages
 	MQTTRouter * pRouter = NULL;
 
-	//The task
+	// Buffers and queues
+	uint8_t xNetworkBuffer[ MQTT_AGENT_NETWORK_BUFFER_SIZE ];
+	uint8_t xStaticQueueStorageArea[ MQTT_AGENT_COMMAND_QUEUE_LENGTH * sizeof( MQTTAgentCommand_t * ) ];
+	StaticQueue_t xStaticQueueStructure;
+	MQTTAgentMessageContext_t xCommandQueue;
+	MQTTAgentContext_t xGlobalMqttAgentContext;
 	TaskHandle_t xHandle = NULL;
 
-	// Current state of the connection for run loop
-	MQTTState connState = Offline;
+	//State machine state
+	MQTTState xConnState = Offline;
 
-	//Handling of the Will for connection
-	//static const char * WILLTOPICFORMAT;
-	char *willTopic = NULL;
-	static const char * WILLPAYLOAD;
-	char *onlineTopic = NULL;
-	static const char * ONLINEPAYLOAD;
-	char *keepAliveTopic = NULL;
 
-	// MQTT Client handles and buffer sizes
-	lwesp_mqtt_client_api_p pMQTTClient = NULL;
-	lwesp_mqtt_client_info_t xMqttClientInfo;
-	size_t xRxBufSize;
-	size_t xTxBufSize;
+	//Storage for publishing message
+	MQTTAgentCommandInfo_t xCommandInfo;
+
+	//Storage for subscribing to message
+	MQTTAgentCommandInfo_t xSubCommandInfo;
+	MQTTSubscribeInfo_t xSubscribeInfo[MAXSUBS] ;
+	MQTTAgentSubscribeArgs_t xSubscribeArgs [MAXSUBS];
+	uint8_t xCurrentSub = 0;
+
 
 	//Single Observer
 	MQTTAgentObserver *pObserver = NULL;

@@ -1,132 +1,194 @@
 /*
  * MQTTAgent.cpp
  *
+ * MQTT Agent to manage MQTT connection and messaging
+ *
  *  Created on: 15 Nov 2021
  *      Author: jondurrant
  */
 
-#include <stdlib.h>
-
 #include "MQTTAgent.h"
-#include "MQTTTopicHelper.h"
+#include <stdlib.h>
+#include "WifiHelper.h"
 
-const char * MQTTAgent::WILLPAYLOAD = "{\"online\":0}";
-const char * MQTTAgent::ONLINEPAYLOAD = "{\"online\":1}";
+/* MQTT Agent ports. */
+#include "freertos_agent_message.h"
+#include "freertos_command_pool.h"
+
+const char * MQTTAgent::WILLTOPICFORMAT = "TNG/%s/LC";
+const char * MQTTAgent::WILLPAYLOAD = "{'online':0}";
+const char * MQTTAgent::ONLINEPAYLOAD = "{'online':1}";
+
 
 
 /***
-	 * Constructor
-	 * @param rxBufSize - size of rx buffer to create
-	 * @param txBufSize - size of tx buffer to create
-	 */
-MQTTAgent::MQTTAgent(size_t rxBufSize, size_t txBufSize) {
-	xRxBufSize = rxBufSize;
-	xTxBufSize = txBufSize;
+ * Constructor
+ * @param sockNum - Socket Number to use
+ * @param eth - Ethernet helper for communicating to hardware
+ */
+MQTTAgent::MQTTAgent() {
+	//NOP
 }
 
 /***
  * Destructor
  */
 MQTTAgent::~MQTTAgent() {
-	if (pMQTTClient != NULL){
-		lwesp_mqtt_client_api_delete(pMQTTClient);
+	if (pWillTopic != NULL){
+		vPortFree(pWillTopic);
+		pWillTopic = NULL;
 	}
 
-	if (willTopic != NULL){
-		vPortFree(willTopic);
-		willTopic = NULL;
+	if (pOnlineTopic != NULL){
+		vPortFree(pOnlineTopic);
+		pOnlineTopic = NULL;
 	}
 
-	if (onlineTopic != NULL){
-		vPortFree(onlineTopic);
-		onlineTopic = NULL;
+	if (pKeepAliveTopic != NULL){
+		vPortFree(pKeepAliveTopic);
+		pKeepAliveTopic = NULL;
 	}
-
-	if (keepAliveTopic != NULL){
-		vPortFree(keepAliveTopic);
-		keepAliveTopic = NULL;
-	}
-
 }
 
 /***
- * Stop task
+ * Initialisation code
  * @return
  */
-void MQTTAgent::stop(){
-	if (xHandle != NULL){
-		vTaskDelete(  xHandle );
-		xHandle = NULL;
-	}
+MQTTStatus_t MQTTAgent::init(){
+	TransportInterface_t xTransport;
+	MQTTStatus_t xReturn;
+	MQTTFixedBuffer_t xFixedBuffer = { .pBuffer = xNetworkBuffer, .size = MQTT_AGENT_NETWORK_BUFFER_SIZE };
 
-	if (pMQTTClient != NULL){
-		lwesp_mqtt_client_api_delete(pMQTTClient);
-		pMQTTClient = NULL;
+
+	MQTTAgentMessageInterface_t messageInterface =
+	{
+		.pMsgCtx        = NULL,
+		.send           = Agent_MessageSend,
+		.recv           = Agent_MessageReceive,
+		.getCommand     = Agent_GetCommand,
+		.releaseCommand = Agent_ReleaseCommand
+	};
+
+	LogDebug( ( "Creating command queue." ) );
+	xCommandQueue.queue = xQueueCreateStatic( MQTT_AGENT_COMMAND_QUEUE_LENGTH,
+											  sizeof( MQTTAgentCommand_t * ),
+											  xStaticQueueStorageArea,
+											  &xStaticQueueStructure );
+	if (xCommandQueue.queue == NULL) {
+		LogDebug(("MQTTAgent::mqttInit ERROR Queue not initialised"));
+		return MQTTIllegalState;
 	}
+	messageInterface.pMsgCtx = &xCommandQueue;
+
+	/* Initialize the task pool. */
+	Agent_InitializePool();
+
+	// Fill in Transforp interface
+	xNetworkContext.mqttTask = NULL;
+	xNetworkContext.tcpTransport = &xTcpTrans;
+	xTransport.pNetworkContext = &xNetworkContext;
+	xTransport.send = IoTSockTrans::staticSend;
+	xTransport.recv = IoTSockTrans::staticRead;
+
+
+	/* Initialize MQTT library. */
+	xReturn = MQTTAgent_Init( &xGlobalMqttAgentContext,
+							  &messageInterface,
+							  &xFixedBuffer,
+							  &xTransport,
+							  IoTSockTrans::getCurrentTime,
+							  MQTTAgent::incomingPublishCallback,
+							  /* Context to pass into the callback. Passing the pointer to subscription array. */
+							  this );
+
+	return xReturn;
+
 }
-
 
 /***
-* Initialise the object
-* @return
-*/
-bool MQTTAgent::init(){
-	pMQTTClient = lwesp_mqtt_client_api_new(xRxBufSize, xTxBufSize);
-	if (pMQTTClient == NULL) {
-		LogError( ("MQTTAgent::init mqtt  failed\n") );
-		return false;
-	} else {
-		LogDebug( ("MQTTAgent::init complete\n") );
-	}
+ * Callback on when new data is received
+ * @param pMqttAgentContext
+ * @param packetId
+ * @param pxPublishInfo
+ */
+void MQTTAgent::incomingPublishCallback( MQTTAgentContext_t * pMqttAgentContext,
+                                        uint16_t packetId,
+                                        MQTTPublishInfo_t * pxPublishInfo ){
 
-	return true;
+	LogDebug(("MSG(%d,%d) %.*s:%.*s\n",
+			pxPublishInfo->topicNameLength,
+			pxPublishInfo->payloadLength,
+			pxPublishInfo->topicNameLength,
+			pxPublishInfo->pTopicName,
+			pxPublishInfo->payloadLength,
+			(char *)pxPublishInfo->pPayload
+			));
+
+	MQTTAgent *a = (MQTTAgent *)pMqttAgentContext->pIncomingCallbackContext;
+	a->route(pxPublishInfo->pTopicName,
+			pxPublishInfo->topicNameLength,
+			pxPublishInfo->pPayload,
+			pxPublishInfo->payloadLength);
+
 }
+
 
 
 /***
  * Set credentials
  * @param user - string pointer. Not copied so pointer must remain valid
  * @param passwd - string pointer. Not copied so pointer must remain valid
- * @param id - string pointer. Not copied so pointer must remain valid. I
- * f not provide ID will be user
- * @return lwespOK if succeeds
+ * @param id - string pointer. Not copied so pointer must remain valid.
+ * If not provide ID will be user
+ *
  */
 void MQTTAgent::credentials(const char * user, const char * passwd, const char * id){
-	this->user = user;
-	this->passwd = passwd;
-	if (id != NULL){
-		this->id = id;
+	if (strcmp(user, "MAC") == 0){
+		WifiHelper::getMACAddressStr(xMacStr);
+		this->pUser = xMacStr;
 	} else {
-		this->id = user;
+		this->pUser = user;
+	}
+	if (strcmp(passwd, "MAC") == 0){
+		WifiHelper::getMACAddressStr(xMacStr);
+		this->pPasswd = xMacStr;
+	} else {
+		this->pPasswd = passwd;
 	}
 
-	if (willTopic == NULL){
-		willTopic = (char *)pvPortMalloc( MQTTTopicHelper::lenLifeCycleTopic(this->id, MQTT_TOPIC_LIFECYCLE_OFFLINE));
-		if (willTopic != NULL){
-			MQTTTopicHelper::genLifeCycleTopic(willTopic, this->id, MQTT_TOPIC_LIFECYCLE_OFFLINE);
+	if (id != NULL){
+		this->pId = id;
+	} else {
+		this->pId = this->pUser;
+	}
+	LogInfo(("MQTT Credentials Id=%s, usr=%s\n", this->pId, this->pUser));
+
+	if (pWillTopic == NULL){
+		pWillTopic = (char *)pvPortMalloc( MQTTTopicHelper::lenLifeCycleTopic(this->pId, MQTT_TOPIC_LIFECYCLE_OFFLINE));
+		if (pWillTopic != NULL){
+			MQTTTopicHelper::genLifeCycleTopic(pWillTopic, this->pId, MQTT_TOPIC_LIFECYCLE_OFFLINE);
 		} else {
 			LogError( ("Unable to allocate LC topic") );
 		}
 	}
 
-	if (onlineTopic == NULL){
-		onlineTopic = (char *)pvPortMalloc( MQTTTopicHelper::lenLifeCycleTopic(this->id, MQTT_TOPIC_LIFECYCLE_ONLINE));
-		if (onlineTopic != NULL){
-			MQTTTopicHelper::genLifeCycleTopic(onlineTopic, this->id, MQTT_TOPIC_LIFECYCLE_ONLINE);
+	if (pOnlineTopic == NULL){
+		pOnlineTopic = (char *)pvPortMalloc( MQTTTopicHelper::lenLifeCycleTopic(this->pId, MQTT_TOPIC_LIFECYCLE_ONLINE));
+		if (pOnlineTopic != NULL){
+			MQTTTopicHelper::genLifeCycleTopic(pOnlineTopic, this->pId, MQTT_TOPIC_LIFECYCLE_ONLINE);
 		} else {
 			LogError( ("Unable to allocate LC topic") );
 		}
 	}
 
-	if (keepAliveTopic == NULL){
-		keepAliveTopic = (char *)pvPortMalloc( MQTTTopicHelper::lenLifeCycleTopic(this->id, MQTT_TOPIC_LIFECYCLE_KEEP_ALIVE));
-		if (keepAliveTopic != NULL){
-			MQTTTopicHelper::genLifeCycleTopic(keepAliveTopic, this->id, MQTT_TOPIC_LIFECYCLE_KEEP_ALIVE);
+	if (pKeepAliveTopic == NULL){
+		pKeepAliveTopic = (char *)pvPortMalloc( MQTTTopicHelper::lenLifeCycleTopic(this->pId, MQTT_TOPIC_LIFECYCLE_KEEP_ALIVE));
+		if (pKeepAliveTopic != NULL){
+			MQTTTopicHelper::genLifeCycleTopic(pKeepAliveTopic, this->pId, MQTT_TOPIC_LIFECYCLE_KEEP_ALIVE);
 		} else {
 			LogError( ("Unable to allocate LC topic") );
 		}
 	}
-	//printf("MQTT Credentials Id=%s, usr=%s, pwd=%s\n", this->id, this->user, this->passwd);
 }
 
 /***
@@ -136,12 +198,13 @@ void MQTTAgent::credentials(const char * user, const char * passwd, const char *
  * @param ssl - unused
  * @return
  */
-bool MQTTAgent::connect(char * target, lwesp_port_t  port, bool recon, bool ssl){
-	this->target = target;
-	this->port = port;
-	this->recon = recon;
-	this->ssl = ssl;
-	setConnState(MQTTConn);
+bool MQTTAgent::mqttConnect(const char * target, uint16_t  port, bool recon, bool ssl){
+	this->pTarget = target;
+	this->xPort = port;
+	this->xSsl = ssl;
+	this->xRecon = recon;
+	setConnState(TCPReq);
+	LogDebug(("TCP Requested\n"));
 	return true;
 }
 
@@ -152,11 +215,11 @@ bool MQTTAgent::connect(char * target, lwesp_port_t  port, bool recon, bool ssl)
 *
 *  */
 void MQTTAgent::start(UBaseType_t priority){
-	if (init() ){
+	if (init() == MQTTSuccess){
 		xTaskCreate(
 			MQTTAgent::vTask,
 			"MQTTAgent",
-			512,
+			2512,
 			( void * ) this,
 			priority,
 			&xHandle
@@ -170,43 +233,97 @@ void MQTTAgent::start(UBaseType_t priority){
  */
  void MQTTAgent::vTask( void * pvParameters ){
 	 MQTTAgent *task = (MQTTAgent *) pvParameters;
-	 if (task->init()){
-		 task->run();
-	 }
+	task->run();
  }
 
 /***
 * Run loop for the task
 */
  void MQTTAgent::run(){
-	 LogDebug( ("MQTTAgent run\n") );
+	 LogDebug(("MQTTAgent run\n"));
+
+	 MQTTStatus_t status;
 
 
 	 for(;;){
 
-		 switch(connState){
+		 switch(xConnState){
 		 case Offline: {
 			 break;
 		 }
-		 case MQTTConn: {
-			 mqttConn();
+		 case TCPReq: {
+			 if (WifiHelper::isJoined()){
+				 TCPconn();
+			 } else {
+				 LogInfo(("Network offline, awaiting reconnect"));
+				 vTaskDelay(MQTT_RECON_DELAY);
+			 }
+			 break;
+		 }
+		 case TCPConned: {
+			 LogDebug(("Attempting MQTT conn\n"));
+			 status = MQTTconn();
+			 if (status == MQTTSuccess){
+				 setConnState(MQTTReq);
+				 LogDebug(("MQTTconn ok\n"));
+			 } else {
+				 setConnState(Offline);
+				 LogDebug(("MQTTConn failed\n"));
+			 }
+			 break;
+		 }
+		 case MQTTReq: {
+			 MQTTsub();
+			 setConnState(MQTTConned);
 			 break;
 		 }
 		 case MQTTConned: {
-			 mqttSub();
 			 setConnState(Online);
-			 pubToTopic(onlineTopic, ONLINEPAYLOAD, strlen(ONLINEPAYLOAD), 1);
-
+			 pubToTopic(pOnlineTopic, ONLINEPAYLOAD, strlen(ONLINEPAYLOAD), 1);
 			 break;
 		 }
-		 case MQTTRecon: {
+		 case Online:{
+			 LogDebug(("Starting CMD loop\n"));
+
+			 status = MQTTAgent_CommandLoop( &xGlobalMqttAgentContext );
+
+			 // The function returns on either receiving a terminate command,
+			 // undergoing network disconnection OR encountering an error.
+			 if( ( status == MQTTSuccess ) && ( xGlobalMqttAgentContext.mqttContext.connectStatus == MQTTNotConnected ) )
+			 {
+				// A terminate command was processed and MQTT connection was closed.
+				// Need to close socket connection.
+				//Platform_DisconnectNetwork( mqttAgentContext.mqttContext.transportInterface.pNetworkContext );
+				 LogDebug(("MQTT Closed\n"));
+				 xTcpTrans.transClose();
+				 setConnState(Offline);
+			 }
+			 else if( status == MQTTSuccess )
+			 {
+				// Terminate command was processed but MQTT connection was not
+				// closed. Thus, need to close both MQTT and socket connections.
+				 LogDebug(("Terminated processed\n"));
+				status = MQTT_Disconnect( &( xGlobalMqttAgentContext.mqttContext ) );
+				//assert( status == MQTTSuccess );
+				//Platform_DisconnectNetwork( mqttAgentContext.mqttContext.transportInterface.pNetworkContext );
+				xTcpTrans.transClose();
+				setConnState(Offline);
+			 }
+			 else
+			 {
+				 // Handle error.
+				 LogDebug(("Command Loop error %d\n", status));
+				 setConnState(Offline);
+
+			 }
+			 break;
+		 }
+		 case MQTTRecon:{
+			 if (WifiHelper::isJoined()){
+				 xTcpTrans.transClose();
+			 }
 			 vTaskDelay(MQTT_RECON_DELAY);
-			 setConnState(MQTTConn);
-			 break;
-		 }
-		 case Online: {
-			 mqttRec();
-
+			 setConnState(TCPReq);
 			 break;
 		 }
 		 default:{
@@ -216,10 +333,15 @@ void MQTTAgent::start(UBaseType_t priority){
 		 };
 
 		 taskYIELD();
+		 //vTaskDelay(1);
 	 }
 
- }
 
+
+	 LogError(("RUN STOPPED\n"));
+
+
+ }
 
 
 
@@ -228,7 +350,7 @@ void MQTTAgent::start(UBaseType_t priority){
 * @return
 */
 const char * MQTTAgent::getId(){
-	return id;
+	return pId;
 }
 
 /***
@@ -238,50 +360,76 @@ const char * MQTTAgent::getId(){
 * @param payloadLen - length of memory block
 */
 bool MQTTAgent::pubToTopic(const char * topic, const void * payload,
-		size_t payloadLen, const uint8_t QoS){
+	size_t payloadLen, const uint8_t QoS){
 
-	lwespr_t status;
-	lwesp_mqtt_qos_t q;
-	switch (QoS){
-	case 0:{
-		q = LWESP_MQTT_QOS_AT_MOST_ONCE;
-		break;
-	}
-	case 1:{
-		q = LWESP_MQTT_QOS_AT_LEAST_ONCE;
-		break;
-	}
-	case 2:{
-		q = LWESP_MQTT_QOS_EXACTLY_ONCE;
-		break;
-	}
-	default:{
-		q = LWESP_MQTT_QOS_AT_MOST_ONCE;
-		break;
-	}
-	}
+	MQTTStatus_t status;
 
-	if (connState == Online){
-		LogDebug( ("Publish to: %s \n", topic ));
 
-		if (pObserver != NULL){
-			pObserver->MQTTSend();
-		}
-		status = lwesp_mqtt_client_api_publish(pMQTTClient, topic,
-				payload, payloadLen, q, false);
-		return (status == lwespOK);
-	} else {
+	// Fill command
+	xCommandInfo.cmdCompleteCallback = MQTTAgent::publishCmdCompleteCb;
+	xCommandInfo.blockTimeMs = 500;
+	MQTTAgentCommandContext_t* pCmdCBContext = (MQTTAgentCommandContext_t*) pvPortMalloc(sizeof(MQTTAgentCommandContext_t));
+	if (pCmdCBContext == NULL){
+		LogError(("malloc failed"));
 		return false;
 	}
+	pCmdCBContext->topic = (char *)pvPortMalloc(strlen(topic)+1);
+	if (pCmdCBContext->topic == NULL){
+		LogError(("malloc failed"));
+		return false;
+	}
+	strcpy(pCmdCBContext->topic,topic);
+	pCmdCBContext->payload = pvPortMalloc(payloadLen);
+	if (pCmdCBContext->payload == NULL){
+		LogError(("malloc failed"));
+		return false;
+	}
+	memcpy(pCmdCBContext->payload, payload, payloadLen);
+	xCommandInfo.pCmdCompleteCallbackContext = pCmdCBContext;
 
+
+	// Fill the information for publish operation.
+	MQTTPublishInfo_t * pPublishInfo = &(pCmdCBContext->publishInfo);
+	pPublishInfo->qos = MQTTQoS1;
+	pPublishInfo->pTopicName = pCmdCBContext->topic;
+	pPublishInfo->topicNameLength = strlen(pCmdCBContext->topic);
+	pPublishInfo->pPayload = pCmdCBContext->payload;
+	pPublishInfo->payloadLength = payloadLen;
+
+	/*
+	LogInfo(("Publishing(%d, %d) %.*s:%.*s\n",
+				pPublishInfo->topicNameLength,
+				pPublishInfo->payloadLength,
+				pPublishInfo->topicNameLength,
+				pPublishInfo->pTopicName,
+				pPublishInfo->payloadLength,
+				pPublishInfo->pPayload
+				));
+				*/
+
+
+	status = MQTTAgent_Publish( &xGlobalMqttAgentContext, pPublishInfo, &xCommandInfo );
+	if (status != MQTTSuccess ){
+		LogError(("publish error %d", status));
+		return false;
+	} else {
+		//LogInfo(("Publish Complete"));
+	}
+
+	if (pObserver != NULL){
+		pObserver->MQTTSend();
+	}
+
+	return true;
 }
 
 /***
 * Close connection
 */
 void MQTTAgent::close(){
+	xTcpTrans.transClose();
+	xRecon=false;
 	setConnState(Offline);
-	lwesp_mqtt_client_api_close( pMQTTClient);
 }
 
 /***
@@ -292,14 +440,83 @@ void MQTTAgent::close(){
 * @param payloadLen - payload length
 */
 void MQTTAgent::route(const char * topic, size_t topicLen, const void * payload, size_t payloadLen){
-	if (pObserver != NULL){
-		pObserver->MQTTRecv();
-	}
-
 	if (pRouter != NULL){
 		pRouter->route(topic, topicLen, payload, payloadLen, this);
 	}
+	if (pObserver != NULL){
+		pObserver->MQTTRecv();
+	}
 }
+
+
+/***
+* Call back function on connect
+* @param pCmdCallbackContext
+* @param pReturnInfo
+*/
+void MQTTAgent::connectCmdCallback( MQTTAgentCommandContext_t * pCmdCallbackContext,
+                         MQTTAgentReturnInfo_t * pReturnInfo ){
+	LogDebug(("ConnectCmdCallback called\n"));
+}
+
+
+/***
+* Connect to MQTT server
+* @return
+*/
+MQTTStatus_t  MQTTAgent::MQTTconn(){
+	MQTTStatus_t xResult;
+	MQTTConnectInfo_t xConnectInfo;
+	bool xSessionPresent = false;
+
+	/* Many fields not used in this demo so start with everything at 0. */
+	( void ) memset( ( void * ) &xConnectInfo, 0x00, sizeof( xConnectInfo ) );
+
+	/* Start with a clean session i.e. direct the MQTT broker to discard any
+	 * previous session data. Also, establishing a connection with clean
+	 * session will ensure that the broker does not store any data when this
+	 * client gets disconnected. */
+	xConnectInfo.cleanSession = true;
+
+	/* The client identifier is used to uniquely identify this MQTT client to
+	 * the MQTT broker. In a production device the identifier can be something
+	 * unique, such as a device serial number. */
+	xConnectInfo.pClientIdentifier = pId;
+	xConnectInfo.clientIdentifierLength = ( uint16_t ) strlen(pId);
+	xConnectInfo.pUserName = pUser;
+	xConnectInfo.userNameLength = ( uint16_t ) strlen(pUser);
+	xConnectInfo.pPassword = pPasswd;
+	xConnectInfo.passwordLength= ( uint16_t ) strlen(pPasswd);
+
+	xWillInfo.qos = MQTTQoS1;
+	sprintf(pWillTopic, MQTTAgent::WILLTOPICFORMAT, pId);
+	xWillInfo.pTopicName = pWillTopic;
+	xWillInfo.topicNameLength = strlen( xWillInfo.pTopicName );
+	xWillInfo.pPayload = MQTTAgent::WILLPAYLOAD;
+	xWillInfo.payloadLength = strlen( MQTTAgent::WILLPAYLOAD );
+
+
+	/* Set MQTT keep-alive period. It is the responsibility of the application
+	 * to ensure that the interval between Control Packets being sent does not
+	 * exceed the Keep Alive value.  In the absence of sending any other
+	 * Control Packets, the Client MUST send a PINGREQ Packet. */
+	xConnectInfo.keepAliveSeconds = MQTTKEEPALIVETIME;
+
+	/* Send MQTT CONNECT packet to broker. LWT is not used in this demo, so it
+	 * is passed as NULL. */
+	LogDebug(("MQTT Connect \n"));
+	xResult = MQTT_Connect( &(xGlobalMqttAgentContext.mqttContext),
+							&xConnectInfo,
+							&xWillInfo,
+							30000U,
+							&xSessionPresent );
+
+	if (xResult != MQTTSuccess){
+		LogError(("MQTTConnect error %d", xResult));
+	}
+	return xResult ;
+}
+
 
 
 /***
@@ -319,84 +536,13 @@ void MQTTAgent::setRouter( MQTTRouter *pRouter) {
 }
 
 /***
-* Connect to server
-* @return
-*/
-bool MQTTAgent::mqttConn(){
-	lwesp_mqtt_conn_status_t conn_status;
-
-
-	xMqttClientInfo.id = id;
-	xMqttClientInfo.user = user;
-	xMqttClientInfo.pass = passwd;
-	xMqttClientInfo.keep_alive = MQTT_KEEP_ALIVE;
-	xMqttClientInfo.will_topic = willTopic;
-	xMqttClientInfo.will_message = WILLPAYLOAD;
-	xMqttClientInfo.will_qos = LWESP_MQTT_QOS_AT_LEAST_ONCE;
-#ifdef LWESPFORK
-	xMqttClientInfo.ssl = this->ssl;
-	LogInfo(("CONNECTING with SSL set to %d", this-ssl));
-#endif
-
-	conn_status = lwesp_mqtt_client_api_connect(pMQTTClient,
-			target, port, &xMqttClientInfo);
-	if (conn_status == LWESP_MQTT_CONN_STATUS_ACCEPTED) {
-		setConnState(MQTTConned);
-		LogDebug( ("Connected and accepted!\r\n") );
-	} else {
-		setConnState(Offline);
-		//printf("MQTT Connect Failed: %d\r\n", (int)conn_status);
-		LogError( ("MQTT Connect Failed %d\n", (int)conn_status ));
-		if (recon){
-			setConnState(MQTTRecon);
-		}
-		return false;
-	}
-	return true;
-}
-
-
-/***
-* Subscribe to a topic, mesg will be sent to router object
-* @param topic
-* @param QoS
-* @return
-*/
-bool MQTTAgent::subToTopic(const char * topic, const uint8_t QoS){
-	LogDebug( ("Subscribe tp %s\n", topic) );
-
-	lwespr_t status;
-	lwesp_mqtt_qos_t q;
-	switch (QoS){
-	case 0:{
-		q = LWESP_MQTT_QOS_AT_MOST_ONCE;
-		break;
-	}
-	case 1:{
-		q = LWESP_MQTT_QOS_AT_LEAST_ONCE;
-		break;
-	}
-	case 2:{
-		q = LWESP_MQTT_QOS_EXACTLY_ONCE;
-		break;
-	}
-	default:{
-		q = LWESP_MQTT_QOS_AT_MOST_ONCE;
-		break;
-	}
-	}
-	status = lwesp_mqtt_client_api_subscribe( pMQTTClient,
-			topic, q);
-	return (status == lwespOK);
-}
-
-/***
-* Subscribe step on connection
-* @return
-*/
-bool MQTTAgent::mqttSub(){
+ * Subscribe to routers list
+ * @return true if succeeds
+ */
+bool MQTTAgent::MQTTsub(){
 
 	if (pRouter != NULL){
+		xCurrentSub = 0;
 		pRouter->subscribe(this);
 		return true;
 	}
@@ -404,35 +550,131 @@ bool MQTTAgent::mqttSub(){
 }
 
 /***
-* Handle Rec of a messahe
-* @return
+ * Call back function nwhen subscribe completes
+ * @param pCmdCallbackContext
+ * @param pReturnInfo
+ */
+void MQTTAgent::subscribeCmdCompleteCb( MQTTAgentCommandContext_t * pCmdCallbackContext,
+	                             MQTTAgentReturnInfo_t * pReturnInfo ){
+	//LogDebug(("Subscription complete\n"));
+}
+
+/***
+* Call back function when Publish completes
+* @param pCmdCallbackContext
+* @param pReturnInfo
 */
-bool MQTTAgent::mqttRec(){
-	lwespr_t res;
-	lwesp_mqtt_client_api_buf_p buf;
-	res = lwesp_mqtt_client_api_receive(pMQTTClient, &buf, 5000);
-	if (res == lwespOK) {
-		if (buf != NULL) {
-			//printf("Topic: %s, payload: %s\r\n", buf->topic, buf->payload);
-			route(buf->topic, buf->topic_len,
-					buf->payload, buf->payload_len );
-			lwesp_mqtt_client_api_buf_free(buf);
-			buf = NULL;
-		}
-	} else if (res == lwespCLOSED) {
-		LogWarn( ("MQTT connection closed!\r\n") );
-		if (recon){
-			LogDebug( ("Reconnect") );
-			setConnState(MQTTRecon);
-		} else {
-			setConnState(Offline);
-		}
-		return false;
-	} else if (res == lwespTIMEOUT) {
-		LogDebug( ("Timeout on MQTT receive function. Manually publishing.\r\n") );
-		pubToTopic(keepAliveTopic, ONLINEPAYLOAD, strlen(ONLINEPAYLOAD), 1);
+void MQTTAgent::publishCmdCompleteCb( MQTTAgentCommandContext_t * pCmdCallbackContext,
+            MQTTAgentReturnInfo_t * pReturnInfo ){
+	//LogDebug(("Publish complete\n"));
+
+	//printf("\n********************\n");
+	//printf("Published to %s %s\n",pCmdCallbackContext->topic, (char *)pCmdCallbackContext->payload);
+	vPortFree(pCmdCallbackContext->topic);
+	vPortFree(pCmdCallbackContext->payload);
+	vPortFree(pCmdCallbackContext);
+}
+
+/***
+ * Subscribe to a topic, mesg will be sent to router object
+ * @param topic
+ * @param QoS
+ * @return
+ */
+bool MQTTAgent::subToTopic(const char * topic,  const uint8_t QoS){
+	MQTTStatus_t status = MQTTNoDataAvailable ;
+
+	// Fill the command information.
+	xSubCommandInfo.cmdCompleteCallback = MQTTAgent::subscribeCmdCompleteCb;
+	xSubCommandInfo.blockTimeMs = 500;
+	//xSubCommandInfo.pCmdCompleteCallbackContext = this;
+
+	uint8_t subNum = xCurrentSub++;
+	if (xCurrentSub > MAXSUBS){
+		LogError(("OVERFLOW"));
 	}
+	MQTTSubscribeInfo_t      *pSubInfo = &xSubscribeInfo[subNum];
+	MQTTAgentSubscribeArgs_t *pSubArgs = &xSubscribeArgs[subNum];
+
+
+	// Fill the information for topic filters to subscribe to.
+	switch(QoS){
+	case 0:{
+		pSubInfo->qos = MQTTQoS0;
+		break;
+	}
+	case 1:{
+		pSubInfo->qos = MQTTQoS1;
+		break;
+	}
+	case 2:{
+		pSubInfo->qos = MQTTQoS2;
+		break;
+	}
+	default:{
+		pSubInfo->qos = MQTTQoS1;
+		break;
+	}
+	}
+	pSubInfo->pTopicFilter = topic;
+	pSubInfo->topicFilterLength = strlen(topic);
+	pSubArgs->pSubscribeInfo = pSubInfo;
+	pSubArgs->numSubscriptions = 1U;
+
+	status = MQTTAgent_Subscribe( &xGlobalMqttAgentContext, pSubArgs, &xSubCommandInfo );
+	if (status != MQTTSuccess){
+		LogError(("Sub error %d", status));
+		return false;
+	}
+
+	if (pObserver != NULL){
+		pObserver->MQTTSend();
+	}
+
 	return true;
+
+}
+
+/***
+ * Connect to MQTT hub
+ * @return
+ */
+bool MQTTAgent::TCPconn(){
+	LogDebug(("TCP Connect...."));
+	if (xTcpTrans.transConnect(pTarget, xPort)){
+		setConnState(TCPConned);
+		LogDebug(("TCP Connected"));
+		return true;
+	} else {
+		LogDebug(("TCP Connection failed"));
+		setConnState(Offline);
+	}
+	return false;
+}
+
+/***
+ * Set a single observer to get call back on state changes
+ * @param obs
+ */
+void MQTTAgent::setObserver(MQTTAgentObserver *obs){
+	pObserver = obs;
+}
+
+
+
+/***
+ * Stop task
+ * @return
+ */
+void MQTTAgent::stop(){
+	if (xConnState != Offline){
+		xTcpTrans.transClose();
+		setConnState(Offline);
+	}
+	if (xHandle != NULL){
+		vTaskDelete(  xHandle );
+		xHandle = NULL;
+	}
 }
 
 /***
@@ -440,12 +682,15 @@ bool MQTTAgent::mqttRec(){
  * @param s
  */
 void MQTTAgent::setConnState(MQTTState s){
-	connState = s;
+	xConnState = s;
 
 	if (pObserver != NULL){
-		switch(connState){
+		switch(xConnState){
 		case Offline:{
 			pObserver->MQTTOffline();
+			if (xRecon){
+				setConnState(MQTTRecon);
+			}
 			break;
 		}
 		case Online:{
@@ -460,11 +705,20 @@ void MQTTAgent::setConnState(MQTTState s){
 }
 
 /***
- * Set a single observer to get call back on state changes
- * @param obs
- */
-void MQTTAgent::setObserver(MQTTAgentObserver *obs){
-	pObserver = obs;
+* Get the FreeRTOS task being used
+* @return
+*/
+TaskHandle_t MQTTAgent::getTask(){
+	return xHandle;
 }
 
-
+/***
+* Get high water for stack
+* @return close to zero means overflow risk
+*/
+unsigned int MQTTAgent::getStakHighWater(){
+	if (xHandle != NULL)
+		return uxTaskGetStackHighWaterMark(xHandle);
+	else
+		return 0;
+}

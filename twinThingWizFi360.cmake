@@ -3,18 +3,18 @@
 
 add_library(twinThingWizFi360 INTERFACE)
 target_sources(twinThingWizFi360 INTERFACE
-#    ${CMAKE_CURRENT_LIST_DIR}/src/MQTTAgent.cpp
-#    ${CMAKE_CURRENT_LIST_DIR}/src/MQTTInterface.cpp
-#    ${CMAKE_CURRENT_LIST_DIR}/src/MQTTRouter.cpp
-#    ${CMAKE_CURRENT_LIST_DIR}/src/MQTTRouterPing.cpp
-#    ${CMAKE_CURRENT_LIST_DIR}/src/MQTTPingTask.cpp
-#    ${CMAKE_CURRENT_LIST_DIR}/src/MQTTTopicHelper.cpp
-#    ${CMAKE_CURRENT_LIST_DIR}/src/State.cpp
-#    ${CMAKE_CURRENT_LIST_DIR}/src/StateObserver.cpp
-#    ${CMAKE_CURRENT_LIST_DIR}/src/StateTemp.cpp
-#    ${CMAKE_CURRENT_LIST_DIR}/src/TwinTask.cpp
-#    ${CMAKE_CURRENT_LIST_DIR}/src/MQTTRouterTwin.cpp
-#	${CMAKE_CURRENT_LIST_DIR}/src/MQTTAgentObserver.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/MQTTAgent.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/MQTTInterface.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/MQTTRouter.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/MQTTRouterPing.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/MQTTPingTask.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/MQTTTopicHelper.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/State.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/StateObserver.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/StateTemp.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/TwinTask.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/MQTTRouterTwin.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/MQTTAgentObserver.cpp
 	${CMAKE_CURRENT_LIST_DIR}/src/WifiHelper.cpp
 	${CMAKE_CURRENT_LIST_DIR}/src/IoTSockTrans.cpp
 )

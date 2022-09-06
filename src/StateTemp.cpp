@@ -52,6 +52,8 @@ StateTemp::StateTemp(const StateTemp &other) {
  */
 void StateTemp::updateTemp(){
 	const float conversion_factor = 3.3f / (1 << 12);
+	adc_select_input(4);
+
 	float v = (float)adc_read() * conversion_factor;
 	float t = 27.0 - ((v - 0.706)/0.001721);
 	if (t != getTemp()){

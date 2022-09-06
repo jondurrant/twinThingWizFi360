@@ -124,3 +124,23 @@ void MQTTPingTask::run(){
 	}
 
 }
+
+/***
+* Get the FreeRTOS task being used
+* @return
+*/
+TaskHandle_t MQTTPingTask::getTask(){
+	return xHandle;
+}
+
+/***
+* Get high water for stack
+* @return close to zero means overflow risk
+*/
+unsigned int MQTTPingTask::getStakHighWater(){
+	if (xHandle != NULL)
+		return uxTaskGetStackHighWaterMark(xHandle);
+	else
+		return 0;
+}
+
